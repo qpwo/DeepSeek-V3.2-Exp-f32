@@ -174,7 +174,7 @@ class Linear(nn.Module):
         bias (bool): Whether to include a bias term. Defaults to False.
         dtype (optional): Data type for the layer. Defaults to `torch.bfloat16`.
     """
-    dtype = torch.bfloat16
+    dtype = torch.float32
     scale_fmt: Optional[str] = None
 
     def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
@@ -422,7 +422,7 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
-    assert x.dtype == torch.bfloat16
+    assert x.dtype in (torch.float32, torch.bfloat16)
     from fast_hadamard_transform import hadamard_transform
     hidden_size = x.size(-1)
     return hadamard_transform(x, scale=hidden_size ** -0.5)
@@ -445,7 +445,7 @@ class Indexer(torch.nn.Module):
         self.softmax_scale = self.head_dim ** -0.5
         self.scale_fmt = args.scale_fmt
 
-        self.register_buffer("k_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.head_dim, dtype=torch.float8_e4m3fn), persistent=False)
+        self.register_buffer("k_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.head_dim, dtype=torch.float32), persistent=False)
         self.register_buffer("k_scale_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.head_dim // block_size, dtype=torch.float32), persistent=False)
 
 
@@ -464,13 +464,11 @@ class Indexer(torch.nn.Module):
         k = torch.cat([k_pe, k_nope], dim=-1)
         q = rotate_activation(q)
         k = rotate_activation(k)
-        q_fp8, q_scale = act_quant(q, block_size, self.scale_fmt)
-        k_fp8, k_scale = act_quant(k, block_size, self.scale_fmt)
-        self.k_cache[:bsz, start_pos:end_pos] = k_fp8
-        self.k_scale_cache[:bsz, start_pos:end_pos] = k_scale
+        self.k_cache[:bsz, start_pos:end_pos] = k
         weights = self.weights_proj(x) * self.n_heads ** -0.5
-        weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
-        index_score = fp8_index(q_fp8.contiguous(), weights, self.k_cache[:bsz, :end_pos].contiguous(), self.k_scale_cache[:bsz, :end_pos].contiguous())
+        weights = weights.unsqueeze(-1) * self.softmax_scale
+        logits = torch.einsum("bmhd,bnd->bmhn", q.float(), self.k_cache[:bsz, :end_pos].float())
+        index_score = (F.relu(logits) * weights.float().unsqueeze(-1)).sum(dim=2)
         if mask is not None:
             index_score += mask
         topk_indices = index_score.topk(min(self.index_topk, end_pos), dim=-1)[1]
@@ -862,7 +860,7 @@ class Transformer(nn.Module):
         global world_size, rank
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         rank = dist.get_rank() if dist.is_initialized() else 0
-        Linear.dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
+        Linear.dtype = torch.float32
         Linear.scale_fmt = args.scale_fmt
         super().__init__()
         self.max_seq_len = args.max_seq_len
@@ -903,7 +901,7 @@ class Transformer(nn.Module):
 
 
 if __name__ == "__main__":
-    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_dtype(torch.float32)
     torch.set_default_device("cuda")
     torch.manual_seed(0)
     args = ModelArgs()
